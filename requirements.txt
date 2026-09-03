@@ -1,0 +1,5 @@
+PyYAML>=6.0
+requests>=2.31.0
+pywin32>=306; sys_platform == "win32"
+pymupdf>=1.24.0; sys_platform == "win32"
+Pillow>=10.0.0; sys_platform == "win32"
