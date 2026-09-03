@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import shutil
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -16,6 +20,7 @@ from urllib.parse import urljoin
 
 import requests
 import yaml
+from requests import exceptions as req_exc
 
 import printing
 
@@ -26,6 +31,9 @@ CACHE_DIR = APP_DIR / "cache"
 THEME_DIR = APP_DIR / "vendor" / "Forest-ttk-theme"
 RECENT_LIMIT = 200
 APP_NAME = "2426_HADP"
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT_API = 30
+READ_TIMEOUT_PDF = 60
 
 
 def load_config() -> Dict[str, Any]:
@@ -84,6 +92,83 @@ def depesche_id(item: Dict[str, Any]) -> str:
     return f"{ts}|{unit}|{link}"
 
 
+def format_network_error(exc: BaseException) -> str:
+    """Menschlich lesbare deutsche Meldung für Netzwerk-/HTTP-Fehler."""
+    if isinstance(exc, req_exc.Timeout):
+        return "Zeitüberschreitung — Server antwortet nicht rechtzeitig"
+    if isinstance(exc, req_exc.SSLError):
+        return f"SSL/TLS-Fehler: {exc}"
+    if isinstance(exc, req_exc.ProxyError):
+        return f"Proxy-Fehler: {exc}"
+    if isinstance(exc, req_exc.HTTPError):
+        status = exc.response.status_code if exc.response is not None else "?"
+        reason = ""
+        if exc.response is not None:
+            reason = (exc.response.reason or "").strip()
+        detail = f" {reason}" if reason else ""
+        return f"HTTP-Fehler {status}{detail}"
+    if isinstance(exc, req_exc.ConnectionError):
+        cause = exc.__cause__ or exc.__context__
+        text = str(cause or exc).lower()
+        if isinstance(cause, ConnectionRefusedError) or "connection refused" in text:
+            return "Verbindung abgelehnt — Server nicht erreichbar"
+        if isinstance(cause, TimeoutError) or "timed out" in text:
+            return "Zeitüberschreitung beim Verbindungsaufbau"
+        if "name or service not known" in text or "getaddrinfo failed" in text:
+            return "DNS-Fehler — Hostname nicht auflösbar"
+        if "nodename nor servname" in text or "name resolution" in text:
+            return "DNS-Fehler — Hostname nicht auflösbar"
+        if "network is unreachable" in text:
+            return "Netzwerk nicht erreichbar"
+        if "temporary failure" in text:
+            return "Temporärer DNS-/Netzwerkfehler"
+        return f"Verbindungsfehler: {cause or exc}"
+    if isinstance(exc, req_exc.ChunkedEncodingError):
+        return "Übertragung abgebrochen — unvollständige Antwort"
+    if isinstance(exc, req_exc.ContentDecodingError):
+        return "Antwort konnte nicht dekodiert werden"
+    if isinstance(exc, req_exc.TooManyRedirects):
+        return "Zu viele Weiterleitungen"
+    if isinstance(exc, req_exc.InvalidURL):
+        return f"Ungültige URL: {exc}"
+    if isinstance(exc, req_exc.RequestException):
+        return f"Netzwerkfehler: {exc}"
+    if isinstance(exc, json.JSONDecodeError):
+        return "Ungültige JSON-Antwort vom Server"
+    return str(exc)
+
+
+def clear_cache_dir() -> int:
+    """Löscht alle Dateien im Cache. Gibt die Anzahl gelöschter Einträge zurück."""
+    if not CACHE_DIR.is_dir():
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        return 0
+    removed = 0
+    for path in CACHE_DIR.iterdir():
+        try:
+            if path.is_file() or path.is_symlink():
+                path.unlink(missing_ok=True)
+                removed += 1
+            elif path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def open_with_default_app(path: Path) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"Datei nicht gefunden: {path.name}")
+    target = str(path.resolve())
+    if sys.platform == "win32":
+        os.startfile(target)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.run(["open", target], check=False)
+    else:
+        subprocess.run(["xdg-open", target], check=False)
+
+
 class ApiClient:
     def __init__(self, host_url: str, token: str) -> None:
         self.host_url = host_url
@@ -91,22 +176,42 @@ class ApiClient:
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
         self.session.headers["Accept"] = "application/json"
+        # Keine endlosen Hänger bei defekten Verbindungen
+        adapter = requests.adapters.HTTPAdapter(max_retries=0)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def fetch_depeschen(self, since: int) -> List[Dict[str, Any]]:
         url = f"{self.host_url}/api/depeschen"
-        with self._lock:
-            response = self.session.get(url, params={"since": since}, timeout=30)
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            with self._lock:
+                response = self.session.get(
+                    url,
+                    params={"since": since},
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT_API),
+                )
+            response.raise_for_status()
+        except req_exc.RequestException as exc:
+            raise RuntimeError(format_network_error(exc)) from exc
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Ungültige JSON-Antwort vom Server") from exc
         if not isinstance(payload, list):
             raise ValueError("API hat keine JSON-Liste zurückgegeben")
         return payload
 
     def download_pdf(self, pdf_link: str, dest: Path) -> None:
         url = urljoin(self.host_url + "/", pdf_link)
-        with self._lock:
-            response = self.session.get(url, timeout=60)
-        response.raise_for_status()
+        try:
+            with self._lock:
+                response = self.session.get(
+                    url,
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT_PDF),
+                )
+            response.raise_for_status()
+        except req_exc.RequestException as exc:
+            raise RuntimeError(format_network_error(exc)) from exc
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(response.content)
 
@@ -122,10 +227,20 @@ class Poller(threading.Thread):
     ) -> None:
         super().__init__(daemon=True, name="depeschen-poller")
         self.client = client
-        self.since = since
+        self._since_lock = threading.Lock()
+        self._since = since
         self.interval = interval
         self.events = events
         self.stop_event = stop_event
+
+    @property
+    def since(self) -> int:
+        with self._since_lock:
+            return self._since
+
+    def set_since(self, value: int) -> None:
+        with self._since_lock:
+            self._since = value
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -133,7 +248,8 @@ class Poller(threading.Thread):
                 items = self.client.fetch_depeschen(self.since)
                 self.events.put(("poll_ok", items))
             except Exception as exc:
-                self.events.put(("poll_error", str(exc)))
+                # Jeder Fehler (Netzwerk, Timeout, …) — Poller läuft weiter
+                self.events.put(("poll_error", format_network_error(exc)))
             if self.stop_event.wait(self.interval):
                 break
 
@@ -269,10 +385,16 @@ class App(tk.Tk):
         self.tree.column("unit", width=160, anchor="w")
         self.tree.column("file", width=280, anchor="w")
         self.tree.column("result", width=140, anchor="w")
-        self.tree.bind("<Double-1>", lambda _e: self.reprint_selected())
+        self.tree.bind("<Double-1>", lambda _e: self.open_selected())
 
         actions = ttk.Frame(list_card)
-        actions.grid(row=1, column=0, sticky="e", pady=(10, 0))
+        actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.reset_btn = ttk.Button(
+            actions,
+            text="Reset",
+            command=self.reset_session,
+        )
+        self.reset_btn.pack(side="left")
         self.reprint_btn = ttk.Button(
             actions,
             text="Auswahl erneut drucken",
@@ -403,7 +525,7 @@ class App(tk.Tk):
             printing.print_pdf(str(dest), printer)
         except Exception as exc:
             result = "fehlgeschlagen"
-            error = str(exc)
+            error = format_network_error(exc)
         return {
             "id": iid,
             "timestamp": ts,
@@ -424,6 +546,8 @@ class App(tk.Tk):
         result = row["result"]
         if row["error"]:
             result = f"fehlgeschlagen: {row['error']}"
+        if self.tree.exists(row["id"]):
+            self.tree.delete(row["id"])
         self.tree.insert(
             "",
             0,
@@ -440,6 +564,37 @@ class App(tk.Tk):
             for extra in children[RECENT_LIMIT:]:
                 self.tree.delete(extra)
                 self.rows.pop(extra, None)
+
+    def open_selected(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            self.var_detail.set("Depesche zum Öffnen auswählen")
+            return
+        row = self.rows.get(selected[0])
+        if not row:
+            return
+        try:
+            open_with_default_app(Path(row["path"]))
+            self.var_detail.set(f"Geöffnet: {row['filename']}")
+        except Exception as exc:
+            self._set_status("error", f"Öffnen fehlgeschlagen: {exc}")
+
+    def reset_session(self) -> None:
+        now = int(time.time())
+        self.poller.set_since(now)
+        self.started_at = now
+        self.seen_ids.clear()
+        removed = clear_cache_dir()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        self.rows.clear()
+        self.print_count = 0
+        self.var_printed.set("0")
+        self.var_since.set(format_ts(now))
+        self._set_status(
+            "waiting",
+            f"Reset — seit {format_ts(now)}, Cache geleert ({removed} Datei(en))",
+        )
 
     def reprint_selected(self) -> None:
         selected = self.tree.selection()
@@ -473,7 +628,7 @@ class App(tk.Tk):
                 lambda: self._finish_reprint(row["id"], "erneut gedruckt", ""),
             )
         except Exception as exc:
-            message = str(exc)
+            message = format_network_error(exc)
             self.after(
                 0,
                 lambda m=message: self._finish_reprint(row["id"], "fehlgeschlagen", m),
