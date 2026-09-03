@@ -43,7 +43,7 @@ def default_printer() -> str:
 
 def print_pdf(path: str, printer: str) -> None:
     if not printer:
-        raise RuntimeError("No printer selected")
+        raise RuntimeError("Kein Drucker ausgewählt")
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
     if sys.platform == "win32":
@@ -88,7 +88,7 @@ def _print_pdf_windows(path: str, printer: str) -> None:
     doc = fitz.open(path)
     if doc.page_count < 1:
         doc.close()
-        raise ValueError("PDF has no pages")
+        raise ValueError("PDF hat keine Seiten")
 
     hdc = win32ui.CreateDC()
     hdc.CreatePrinterDC(printer)
@@ -97,7 +97,7 @@ def _print_pdf_windows(path: str, printer: str) -> None:
     if printable_w < 1 or printable_h < 1:
         hdc.DeleteDC()
         doc.close()
-        raise RuntimeError(f"Printer '{printer}' reported no printable area")
+        raise RuntimeError(f"Drucker '{printer}' meldet keinen druckbaren Bereich")
 
     started = False
     try:

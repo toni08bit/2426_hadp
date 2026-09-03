@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Poll /api/depeschen and print new PDFs. Forest-themed status UI."""
+"""Depeschen von /api/depeschen abfragen und neue PDFs drucken. Forest-UI."""
 
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -15,43 +16,66 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
-import yaml
 
 import printing
 
 APP_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = APP_DIR / "config.yml"
+ENV_PATH = APP_DIR / ".env"
 STATE_PATH = APP_DIR / "state.json"
 CACHE_DIR = APP_DIR / "cache"
 THEME_DIR = APP_DIR / "vendor" / "Forest-ttk-theme"
 RECENT_LIMIT = 200
+APP_NAME = "2426_HADP"
+
+
+def load_dotenv(path: Path = ENV_PATH) -> None:
+    """Load KEY=VALUE pairs from .env into os.environ (does not override)."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def load_config() -> Dict[str, Any]:
-    if not CONFIG_PATH.is_file():
-        example = APP_DIR / "config.example.yml"
+    load_dotenv()
+    if not ENV_PATH.is_file():
+        example = APP_DIR / ".env.example"
         raise FileNotFoundError(
-            f"Missing {CONFIG_PATH.name}. Copy {example.name} to config.yml and fill it in."
+            f"{ENV_PATH.name} fehlt. Kopieren Sie {example.name} nach .env "
+            "und tragen Sie Ihre Werte ein."
         )
-    with CONFIG_PATH.open(encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
-    host = str(data.get("host_url") or "").rstrip("/")
-    token = str(data.get("bearer_token") or "").strip()
-    interval = int(data.get("poll_interval_seconds") or 5)
+
+    host = str(os.environ.get("HOST_URL") or "").rstrip("/")
+    token = str(os.environ.get("BEARER_TOKEN") or "").strip()
+    try:
+        interval = int(os.environ.get("POLL_INTERVAL_SECONDS") or 5)
+    except ValueError as exc:
+        raise ValueError(".env: POLL_INTERVAL_SECONDS muss eine Zahl sein") from exc
+
     if not host:
-        raise ValueError("config.yml: host_url is required")
+        raise ValueError(".env: HOST_URL ist erforderlich")
     if not token:
-        raise ValueError("config.yml: bearer_token is required")
+        raise ValueError(".env: BEARER_TOKEN ist erforderlich")
     if interval < 1:
-        raise ValueError("config.yml: poll_interval_seconds must be >= 1")
-    theme = str(data.get("theme") or "forest-dark")
+        raise ValueError(".env: POLL_INTERVAL_SECONDS muss >= 1 sein")
+
+    theme = str(os.environ.get("THEME") or "forest-dark").strip()
     if theme not in ("forest-dark", "forest-light"):
         theme = "forest-dark"
     return {
         "host_url": host,
         "bearer_token": token,
         "poll_interval_seconds": interval,
-        "printer": str(data.get("printer") or "").strip(),
+        "printer": str(os.environ.get("PRINTER") or "").strip(),
         "theme": theme,
     }
 
@@ -72,7 +96,7 @@ def save_state(state: Dict[str, Any]) -> None:
 def format_ts(unix: Optional[float]) -> str:
     if unix is None:
         return "—"
-    return datetime.fromtimestamp(unix).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(unix).strftime("%d.%m.%Y %H:%M:%S")
 
 
 def depesche_id(item: Dict[str, Any]) -> str:
@@ -97,7 +121,7 @@ class ApiClient:
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, list):
-            raise ValueError("API did not return a JSON list")
+            raise ValueError("API hat keine JSON-Liste zurückgegeben")
         return payload
 
     def download_pdf(self, pdf_link: str, dest: Path) -> None:
@@ -153,7 +177,7 @@ class App(tk.Tk):
 
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.title("24h Depeschen-Druck")
+        self.title(APP_NAME)
         self.minsize(820, 520)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -170,12 +194,12 @@ class App(tk.Tk):
         )
         self.poller.start()
         self.after(150, self._drain_events)
-        self._set_status("waiting", "Waiting for first poll…")
+        self._set_status("waiting", "Warte auf erste Abfrage…")
 
     def _apply_forest_theme(self, theme: str) -> None:
         tcl = THEME_DIR / f"{theme}.tcl"
         if not tcl.is_file():
-            raise FileNotFoundError(f"Forest theme not found: {tcl}")
+            raise FileNotFoundError(f"Forest-Theme nicht gefunden: {tcl}")
         self.tk.call("source", str(tcl))
         style = ttk.Style(self)
         style.theme_use(theme)
@@ -192,10 +216,8 @@ class App(tk.Tk):
 
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 16))
-        ttk.Label(header, text="24h Depeschen-Druck", style="Title.TLabel").pack(
-            side="left"
-        )
-        self.status_dot = ttk.Label(header, text="●  starting", style="Status.TLabel")
+        ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left")
+        self.status_dot = ttk.Label(header, text="●  startet", style="Status.TLabel")
         self.status_dot.pack(side="right")
 
         status_card = ttk.LabelFrame(outer, text="Status", padding=(16, 12))
@@ -215,15 +237,15 @@ class App(tk.Tk):
         self.var_printer = tk.StringVar(value="")
 
         self._status_cell(status_card, 0, 0, "Host", self.var_host)
-        self._status_cell(status_card, 0, 1, "Poll interval", self.var_interval)
-        self._status_cell(status_card, 0, 2, "Listening since", self.var_since)
-        self._status_cell(status_card, 0, 3, "Last poll", self.var_last_poll)
-        self._status_cell(status_card, 1, 0, "Polls", self.var_polls)
-        self._status_cell(status_card, 1, 1, "Printed this session", self.var_printed)
+        self._status_cell(status_card, 0, 1, "Abfrageintervall", self.var_interval)
+        self._status_cell(status_card, 0, 2, "Aktiv seit", self.var_since)
+        self._status_cell(status_card, 0, 3, "Letzte Abfrage", self.var_last_poll)
+        self._status_cell(status_card, 1, 0, "Abfragen", self.var_polls)
+        self._status_cell(status_card, 1, 1, "Gedruckt (Sitzung)", self.var_printed)
 
         printer_box = ttk.Frame(status_card)
         printer_box.grid(row=1, column=2, columnspan=2, sticky="ew", padx=8, pady=8)
-        ttk.Label(printer_box, text="Printer", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(printer_box, text="Drucker", style="Muted.TLabel").pack(anchor="w")
         self.printer_combo = ttk.Combobox(
             printer_box,
             textvariable=self.var_printer,
@@ -237,7 +259,9 @@ class App(tk.Tk):
             row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 0)
         )
 
-        list_card = ttk.LabelFrame(outer, text="Recently printed Depeschen", padding=(12, 10))
+        list_card = ttk.LabelFrame(
+            outer, text="Kürzlich gedruckte Depeschen", padding=(12, 10)
+        )
         list_card.grid(row=2, column=0, sticky="nsew")
         list_card.columnconfigure(0, weight=1)
         list_card.rowconfigure(0, weight=1)
@@ -259,10 +283,10 @@ class App(tk.Tk):
         )
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll.config(command=self.tree.yview)
-        self.tree.heading("time", text="Time")
-        self.tree.heading("unit", text="Unit")
+        self.tree.heading("time", text="Zeit")
+        self.tree.heading("unit", text="Einheit")
         self.tree.heading("file", text="PDF")
-        self.tree.heading("result", text="Result")
+        self.tree.heading("result", text="Ergebnis")
         self.tree.column("time", width=170, anchor="w")
         self.tree.column("unit", width=160, anchor="w")
         self.tree.column("file", width=280, anchor="w")
@@ -273,7 +297,7 @@ class App(tk.Tk):
         actions.grid(row=1, column=0, sticky="e", pady=(10, 0))
         self.reprint_btn = ttk.Button(
             actions,
-            text="Reprint selected",
+            text="Auswahl erneut drucken",
             style="Accent.TButton",
             command=self.reprint_selected,
         )
@@ -294,7 +318,7 @@ class App(tk.Tk):
             printers = printing.list_printers()
         except Exception as exc:
             printers = []
-            self.var_detail.set(f"Could not list printers: {exc}")
+            self.var_detail.set(f"Drucker konnten nicht geladen werden: {exc}")
         self.printer_combo["values"] = printers
         state = load_state()
         preferred = (
@@ -313,16 +337,16 @@ class App(tk.Tk):
         printer = self.var_printer.get().strip()
         if printer:
             save_state({**load_state(), "printer": printer})
-            self.var_detail.set(f"Printer set to {printer}")
+            self.var_detail.set(f"Drucker gesetzt auf {printer}")
 
     def _set_status(self, kind: str, detail: str) -> None:
         labels = {
             "ok": "●  online",
-            "error": "●  error",
-            "waiting": "●  waiting",
-            "printing": "●  printing",
+            "error": "●  Fehler",
+            "waiting": "●  wartend",
+            "printing": "●  druckt",
         }
-        self.status_dot.configure(text=labels.get(kind, "●  status"))
+        self.status_dot.configure(text=labels.get(kind, "●  Status"))
         self.var_detail.set(detail)
 
     def _drain_events(self) -> None:
@@ -336,7 +360,7 @@ class App(tk.Tk):
                     self.var_polls.set(str(self.poll_count))
                     self.last_poll = time.time()
                     self.var_last_poll.set(format_ts(self.last_poll))
-                    self._set_status("error", f"Poll failed: {payload}")
+                    self._set_status("error", f"Abfrage fehlgeschlagen: {payload}")
         except queue.Empty:
             pass
         if not self.stop_event.is_set():
@@ -357,10 +381,14 @@ class App(tk.Tk):
             self.seen_ids.add(iid)
             new_items.append(item)
         if not new_items:
-            self._set_status("ok", f"Poll ok — {len(items)} known, nothing new")
+            self._set_status(
+                "ok", f"Abfrage OK — {len(items)} bekannt, nichts Neues"
+            )
             return
         printer = self.var_printer.get().strip()
-        self._set_status("printing", f"Printing {len(new_items)} new Depesche(n)…")
+        self._set_status(
+            "printing", f"Drucke {len(new_items)} neue Depesche(n)…"
+        )
         threading.Thread(
             target=self._print_batch,
             args=(new_items, printer),
@@ -375,7 +403,8 @@ class App(tk.Tk):
         self.after(
             0,
             lambda: self._set_status(
-                "ok", f"Finished batch ({len(items)}). Last poll {format_ts(self.last_poll)}"
+                "ok",
+                f"Stapel fertig ({len(items)}). Letzte Abfrage {format_ts(self.last_poll)}",
             ),
         )
 
@@ -386,16 +415,16 @@ class App(tk.Tk):
         filename = Path(pdf_link).name or "depesche.pdf"
         dest = CACHE_DIR / filename
         iid = depesche_id(item)
-        result = "printed"
+        result = "gedruckt"
         error = ""
         try:
             if not printer:
-                raise RuntimeError("Select a printer first")
+                raise RuntimeError("Bitte zuerst einen Drucker wählen")
             if not dest.is_file():
                 self.client.download_pdf(pdf_link, dest)
             printing.print_pdf(str(dest), printer)
         except Exception as exc:
-            result = "failed"
+            result = "fehlgeschlagen"
             error = str(exc)
         return {
             "id": iid,
@@ -411,12 +440,12 @@ class App(tk.Tk):
 
     def _add_row(self, row: Dict[str, Any]) -> None:
         self.rows[row["id"]] = row
-        if row["result"] == "printed":
+        if row["result"] == "gedruckt":
             self.print_count += 1
         self.var_printed.set(str(self.print_count))
         result = row["result"]
         if row["error"]:
-            result = f"failed: {row['error']}"
+            result = f"fehlgeschlagen: {row['error']}"
         self.tree.insert(
             "",
             0,
@@ -437,7 +466,7 @@ class App(tk.Tk):
     def reprint_selected(self) -> None:
         selected = self.tree.selection()
         if not selected:
-            self.var_detail.set("Select a Depesche to reprint")
+            self.var_detail.set("Depesche zum erneuten Drucken auswählen")
             return
         iid = selected[0]
         row = self.rows.get(iid)
@@ -445,7 +474,7 @@ class App(tk.Tk):
             return
         printer = self.var_printer.get().strip()
         if not printer:
-            self.var_detail.set("Select a printer first")
+            self.var_detail.set("Bitte zuerst einen Drucker wählen")
             return
         self.reprint_btn.state(["disabled"])
         threading.Thread(
@@ -463,27 +492,27 @@ class App(tk.Tk):
             printing.print_pdf(str(dest), printer)
             self.after(
                 0,
-                lambda: self._finish_reprint(row["id"], "reprinted", ""),
+                lambda: self._finish_reprint(row["id"], "erneut gedruckt", ""),
             )
         except Exception as exc:
             message = str(exc)
             self.after(
                 0,
-                lambda m=message: self._finish_reprint(row["id"], "failed", m),
+                lambda m=message: self._finish_reprint(row["id"], "fehlgeschlagen", m),
             )
 
     def _finish_reprint(self, iid: str, result: str, error: str) -> None:
         self.reprint_btn.state(["!disabled"])
-        display = result if not error else f"failed: {error}"
+        display = result if not error else f"fehlgeschlagen: {error}"
         if self.tree.exists(iid):
             values = list(self.tree.item(iid, "values"))
             if len(values) >= 4:
                 values[3] = display
                 self.tree.item(iid, values=values)
         if error:
-            self._set_status("error", f"Reprint failed: {error}")
+            self._set_status("error", f"Nachdruck fehlgeschlagen: {error}")
         else:
-            self._set_status("ok", "Reprinted")
+            self._set_status("ok", "Erneut gedruckt")
             self.print_count += 1
             self.var_printed.set(str(self.print_count))
 
@@ -497,10 +526,10 @@ def main() -> None:
         config = load_config()
     except Exception as exc:
         root = tk.Tk()
-        root.title("24h Depeschen-Druck")
+        root.title(APP_NAME)
         root.geometry("560x160")
         ttk.Label(root, text=str(exc), wraplength=520, padding=20).pack()
-        ttk.Button(root, text="Quit", command=root.destroy).pack(pady=10)
+        ttk.Button(root, text="Beenden", command=root.destroy).pack(pady=10)
         root.mainloop()
         raise SystemExit(1) from exc
     app = App(config)
