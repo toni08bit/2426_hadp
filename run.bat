@@ -1,18 +1,14 @@
 @echo off
 cd /d "%~dp0"
 
-if not exist ".env" (
-    echo.
-    echo  [.env fehlt] Bitte legen Sie eine .env-Datei an ^(siehe .env.example^).
-    echo.
+if not exist ".env\Scripts\python.exe" (
+    echo Fehler: Python-Umgebung ".env" nicht gefunden.
+    echo Bitte zuerst anlegen und Abhaengigkeiten installieren:
+    echo   python -m venv .env
+    echo   .env\Scripts\pip install -r requirements.txt
     pause
     exit /b 1
 )
 
-rem KEY=VALUE aus .env in die Umgebung laden (ohne Anführungszeichen um die Werte).
-for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do (
-    if not "%%A"=="" set "%%A=%%B"
-)
-
-python app.py
+".env\Scripts\python.exe" app.py
 if errorlevel 1 pause

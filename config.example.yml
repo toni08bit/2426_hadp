@@ -1,0 +1,12 @@
+# Diese Datei nach config.yml kopieren und Werte eintragen.
+# Die Oberfläche ändert Host, Token und Intervall nicht — nur den Drucker.
+
+host_url: "https://example.invalid"
+poll_interval_seconds: 5
+bearer_token: "replace-with-your-token"
+
+# Optionaler Standarddrucker (Windows-Druckername). Kann auch in der UI gewählt werden.
+printer: ""
+
+# forest-dark oder forest-light
+theme: forest-dark

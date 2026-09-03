@@ -1,9 +1,9 @@
-.env
 config.yml
 state.json
 cache/
 __pycache__/
 *.pyc
+.env/
 .venv/
 venv/
 env/

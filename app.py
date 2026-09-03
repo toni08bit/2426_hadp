@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Depeschen von /api/depeschen abfragen und neue PDFs drucken. Forest-UI."""
+"""Holt /api/depeschen und druckt neue PDFs. Status-Oberfläche im Forest-Theme."""
 
 from __future__ import annotations
 
 import json
-import os
 import queue
 import threading
 import time
@@ -16,11 +15,12 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
+import yaml
 
 import printing
 
 APP_DIR = Path(__file__).resolve().parent
-ENV_PATH = APP_DIR / ".env"
+CONFIG_PATH = APP_DIR / "config.yml"
 STATE_PATH = APP_DIR / "state.json"
 CACHE_DIR = APP_DIR / "cache"
 THEME_DIR = APP_DIR / "vendor" / "Forest-ttk-theme"
@@ -28,54 +28,32 @@ RECENT_LIMIT = 200
 APP_NAME = "2426_HADP"
 
 
-def load_dotenv(path: Path = ENV_PATH) -> None:
-    """Load KEY=VALUE pairs from .env into os.environ (does not override)."""
-    if not path.is_file():
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
 def load_config() -> Dict[str, Any]:
-    load_dotenv()
-    if not ENV_PATH.is_file():
-        example = APP_DIR / ".env.example"
+    if not CONFIG_PATH.is_file():
+        example = APP_DIR / "config.example.yml"
         raise FileNotFoundError(
-            f"{ENV_PATH.name} fehlt. Kopieren Sie {example.name} nach .env "
-            "und tragen Sie Ihre Werte ein."
+            f"{CONFIG_PATH.name} fehlt. Kopieren Sie {example.name} nach config.yml "
+            "und tragen Sie die Werte ein."
         )
-
-    host = str(os.environ.get("HOST_URL") or "").rstrip("/")
-    token = str(os.environ.get("BEARER_TOKEN") or "").strip()
-    try:
-        interval = int(os.environ.get("POLL_INTERVAL_SECONDS") or 5)
-    except ValueError as exc:
-        raise ValueError(".env: POLL_INTERVAL_SECONDS muss eine Zahl sein") from exc
-
+    with CONFIG_PATH.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    host = str(data.get("host_url") or "").rstrip("/")
+    token = str(data.get("bearer_token") or "").strip()
+    interval = int(data.get("poll_interval_seconds") or 5)
     if not host:
-        raise ValueError(".env: HOST_URL ist erforderlich")
+        raise ValueError("config.yml: host_url ist erforderlich")
     if not token:
-        raise ValueError(".env: BEARER_TOKEN ist erforderlich")
+        raise ValueError("config.yml: bearer_token ist erforderlich")
     if interval < 1:
-        raise ValueError(".env: POLL_INTERVAL_SECONDS muss >= 1 sein")
-
-    theme = str(os.environ.get("THEME") or "forest-dark").strip()
+        raise ValueError("config.yml: poll_interval_seconds muss >= 1 sein")
+    theme = str(data.get("theme") or "forest-dark")
     if theme not in ("forest-dark", "forest-light"):
         theme = "forest-dark"
     return {
         "host_url": host,
         "bearer_token": token,
         "poll_interval_seconds": interval,
-        "printer": str(os.environ.get("PRINTER") or "").strip(),
+        "printer": str(data.get("printer") or "").strip(),
         "theme": theme,
     }
 
@@ -194,7 +172,7 @@ class App(tk.Tk):
         )
         self.poller.start()
         self.after(150, self._drain_events)
-        self._set_status("waiting", "Warte auf erste Abfrage…")
+        self._set_status("waiting", "Warte auf ersten Abruf…")
 
     def _apply_forest_theme(self, theme: str) -> None:
         tcl = THEME_DIR / f"{theme}.tcl"
@@ -237,10 +215,10 @@ class App(tk.Tk):
         self.var_printer = tk.StringVar(value="")
 
         self._status_cell(status_card, 0, 0, "Host", self.var_host)
-        self._status_cell(status_card, 0, 1, "Abfrageintervall", self.var_interval)
+        self._status_cell(status_card, 0, 1, "Abrufintervall", self.var_interval)
         self._status_cell(status_card, 0, 2, "Aktiv seit", self.var_since)
-        self._status_cell(status_card, 0, 3, "Letzte Abfrage", self.var_last_poll)
-        self._status_cell(status_card, 1, 0, "Abfragen", self.var_polls)
+        self._status_cell(status_card, 0, 3, "Letzter Abruf", self.var_last_poll)
+        self._status_cell(status_card, 1, 0, "Abrufe", self.var_polls)
         self._status_cell(status_card, 1, 1, "Gedruckt (Sitzung)", self.var_printed)
 
         printer_box = ttk.Frame(status_card)
@@ -260,7 +238,7 @@ class App(tk.Tk):
         )
 
         list_card = ttk.LabelFrame(
-            outer, text="Kürzlich gedruckte Depeschen", padding=(12, 10)
+            outer, text="Zuletzt gedruckte Depeschen", padding=(12, 10)
         )
         list_card.grid(row=2, column=0, sticky="nsew")
         list_card.columnconfigure(0, weight=1)
@@ -360,7 +338,7 @@ class App(tk.Tk):
                     self.var_polls.set(str(self.poll_count))
                     self.last_poll = time.time()
                     self.var_last_poll.set(format_ts(self.last_poll))
-                    self._set_status("error", f"Abfrage fehlgeschlagen: {payload}")
+                    self._set_status("error", f"Abruf fehlgeschlagen: {payload}")
         except queue.Empty:
             pass
         if not self.stop_event.is_set():
@@ -382,7 +360,7 @@ class App(tk.Tk):
             new_items.append(item)
         if not new_items:
             self._set_status(
-                "ok", f"Abfrage OK — {len(items)} bekannt, nichts Neues"
+                "ok", f"Abruf ok — {len(items)} bekannt, nichts Neues"
             )
             return
         printer = self.var_printer.get().strip()
@@ -404,7 +382,7 @@ class App(tk.Tk):
             0,
             lambda: self._set_status(
                 "ok",
-                f"Stapel fertig ({len(items)}). Letzte Abfrage {format_ts(self.last_poll)}",
+                f"Stapel fertig ({len(items)}). Letzter Abruf {format_ts(self.last_poll)}",
             ),
         )
 
@@ -510,7 +488,7 @@ class App(tk.Tk):
                 values[3] = display
                 self.tree.item(iid, values=values)
         if error:
-            self._set_status("error", f"Nachdruck fehlgeschlagen: {error}")
+            self._set_status("error", f"Erneuter Druck fehlgeschlagen: {error}")
         else:
             self._set_status("ok", "Erneut gedruckt")
             self.print_count += 1
