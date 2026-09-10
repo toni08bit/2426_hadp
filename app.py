@@ -4,11 +4,9 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import tkinter as tk
@@ -160,13 +158,7 @@ def clear_cache_dir() -> int:
 def open_with_default_app(path: Path) -> None:
     if not path.is_file():
         raise FileNotFoundError(f"Datei nicht gefunden: {path.name}")
-    target = str(path.resolve())
-    if sys.platform == "win32":
-        os.startfile(target)  # type: ignore[attr-defined]
-    elif sys.platform == "darwin":
-        subprocess.run(["open", target], check=False)
-    else:
-        subprocess.run(["xdg-open", target], check=False)
+    subprocess.run(["xdg-open", str(path.resolve())], check=False)
 
 
 class ApiClient:
@@ -298,9 +290,9 @@ class App(tk.Tk):
         style = ttk.Style(self)
         style.theme_use(theme)
         self.configure(background=style.lookup(".", "background") or "#313131")
-        style.configure("Status.TLabel", font=("Segoe UI", 11, "bold"))
+        style.configure("Status.TLabel", font=("DejaVu Sans", 11, "bold"))
         style.configure("Muted.TLabel", foreground="#b0b0b0")
-        style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
+        style.configure("Title.TLabel", font=("DejaVu Sans", 16, "bold"))
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=20)
