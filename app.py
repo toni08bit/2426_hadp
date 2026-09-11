@@ -812,24 +812,34 @@ class App(tk.Tk):
         ttk.Label(cell, textvariable=variable).pack(anchor="w")
 
     def _load_printers(self) -> None:
+        error = ""
         try:
             printers = printing.list_printers()
         except Exception as exc:
             printers = []
-            self.var_detail.set(f"Drucker konnten nicht geladen werden: {exc}")
-        self.printer_combo["values"] = printers
+            error = str(exc)
         state = load_state()
         preferred = (
             str(state.get("printer") or "").strip()
-            or self.config_data.get("printer")
+            or str(self.config_data.get("printer") or "").strip()
             or printing.default_printer()
         )
-        if preferred and preferred in printers:
+        if preferred and preferred not in printers:
+            printers = [preferred] + printers
+        self.printer_combo["values"] = printers
+        if preferred:
             self.var_printer.set(preferred)
         elif printers:
             self.var_printer.set(printers[0])
         if self.var_printer.get():
             save_state({**state, "printer": self.var_printer.get()})
+        elif error:
+            self.var_detail.set(f"Drucker konnten nicht geladen werden: {error}")
+        else:
+            self.var_detail.set(
+                "Keine CUPS-Drucker gefunden. Drucker in CUPS anlegen "
+                "oder in config.yml unter printer setzen."
+            )
 
     def _on_printer_changed(self, _event: object = None) -> None:
         printer = self.var_printer.get().strip()
