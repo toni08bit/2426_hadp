@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -35,19 +36,25 @@ READ_TIMEOUT_API = 30
 READ_TIMEOUT_PDF = 60
 PRINT_FILTERS = ("none", "all", "only_responsible")
 
-# Same palette as f1937 dash (web/utility.js)
+STATUS_DARK_GRAY = "#3a3a3a"
+STATUS_YELLOW = "#e8c200"
+STATUS_RED = "#E24B4A"
+STATUS_HATCH = "#252525"
+
 UNIT_STATUS_COLORS: Dict[Union[int, str], str] = {
-    0: "#E24B4A",
-    1: "#4ee2a7",
-    2: "#4ee2a7",
-    3: "#4aace2",
-    4: "#e8a000",
-    5: "#E24B4A",
-    6: "#888888",
-    "A": "#e8a000",
+    0: STATUS_RED,
+    1: STATUS_DARK_GRAY,
+    2: STATUS_DARK_GRAY,
+    3: STATUS_YELLOW,
+    4: STATUS_RED,
+    5: STATUS_RED,
+    6: STATUS_DARK_GRAY,
+    "A": STATUS_YELLOW,
 }
 FLASH_STATUSES = {0, 5, "A"}
-UNKNOWN_STATUS_COLOR = "#444444"
+HATCH_STATUSES = {6}
+UNKNOWN_STATUS_COLOR = STATUS_DARK_GRAY
+UNIT_ENTRY_RE = re.compile(r"^(?P<label>.+?)\s*\((?P<unit>[^)]+)\)\s*$")
 
 
 def load_config() -> Dict[str, Any]:
@@ -74,7 +81,11 @@ def load_config() -> Dict[str, Any]:
     raw_units = data.get("responsible_units") or []
     if not isinstance(raw_units, list):
         raise ValueError("config.yml: responsible_units muss eine Liste sein")
-    responsible = [str(u).strip() for u in raw_units if str(u).strip()]
+    responsible = [
+        parse_responsible_unit(str(u))
+        for u in raw_units
+        if str(u).strip()
+    ]
     print_filter = str(data.get("print_filter") or "all").strip().lower()
     if print_filter not in PRINT_FILTERS:
         raise ValueError(
@@ -89,6 +100,18 @@ def load_config() -> Dict[str, Any]:
         "responsible_units": responsible,
         "print_filter": print_filter,
     }
+
+
+def parse_responsible_unit(raw: str) -> Dict[str, str]:
+    """Parse 'Anzeigename (EINHEITSNAME)'; bare names stay label and unit."""
+    text = raw.strip()
+    match = UNIT_ENTRY_RE.match(text)
+    if match:
+        label = match.group("label").strip()
+        unit = match.group("unit").strip()
+        if label and unit:
+            return {"label": label, "unit": unit}
+    return {"label": text, "unit": text}
 
 
 def load_state() -> Dict[str, Any]:
@@ -145,6 +168,10 @@ def unit_status_color(status: Any) -> str:
 
 def status_should_flash(status: Any) -> bool:
     return normalize_unit_status(status) in FLASH_STATUSES
+
+
+def status_should_hatch(status: Any) -> bool:
+    return normalize_unit_status(status) in HATCH_STATUSES
 
 
 def mix_hex(hex_color: str, other: str, amount: float) -> str:
@@ -375,13 +402,13 @@ class TableauWindow(tk.Toplevel):
     def __init__(
         self,
         master: tk.Tk,
-        unit_names: List[str],
+        units: List[Dict[str, str]],
         dark: bool,
         on_close,
     ) -> None:
         super().__init__(master)
         self.title(f"{APP_NAME} — Tableau")
-        self.unit_names = list(unit_names)
+        self.units = list(units)
         self._on_close = on_close
         self.protocol("WM_DELETE_WINDOW", self._handle_close)
         self.minsize(720, 320)
@@ -417,7 +444,7 @@ class TableauWindow(tk.Toplevel):
         self.canvas.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         self.canvas.bind("<Configure>", lambda _e: self._redraw())
 
-        self._statuses: Dict[str, Any] = {name: None for name in self.unit_names}
+        self._statuses: Dict[str, Any] = {u["unit"]: None for u in self.units}
         self._redraw()
         self._tick_flash()
 
@@ -447,7 +474,7 @@ class TableauWindow(tk.Toplevel):
         self._flash_phase = (
             self._flash_phase + self._flash_tick_ms / self._flash_period_ms
         ) % 1.0
-        if any(status_should_flash(self._statuses.get(name)) for name in self.unit_names):
+        if any(status_should_flash(self._statuses.get(u["unit"])) for u in self.units):
             self._redraw()
         self._flash_job = self.after(self._flash_tick_ms, self._tick_flash)
 
@@ -457,9 +484,9 @@ class TableauWindow(tk.Toplevel):
             for u in units
             if isinstance(u, dict) and str(u.get("name") or "").strip()
         }
-        for name in self.unit_names:
-            unit = by_name.get(name)
-            self._statuses[name] = None if unit is None else unit.get("status")
+        for entry in self.units:
+            unit = by_name.get(entry["unit"])
+            self._statuses[entry["unit"]] = None if unit is None else unit.get("status")
         if error:
             self._set_status("offline", f"Abruf fehlgeschlagen: {error}")
         else:
@@ -490,8 +517,8 @@ class TableauWindow(tk.Toplevel):
         self.canvas.delete("all")
         width = max(self.canvas.winfo_width(), 1)
         height = max(self.canvas.winfo_height(), 1)
-        names = self.unit_names
-        if not names:
+        entries = self.units
+        if not entries:
             self.canvas.create_text(
                 width / 2,
                 height / 2,
@@ -501,7 +528,7 @@ class TableauWindow(tk.Toplevel):
             )
             return
 
-        count = len(names)
+        count = len(entries)
         cols = max(1, min(count, int(math.ceil(math.sqrt(count)))))
         rows = int(math.ceil(count / cols))
         cell_w = width / cols
@@ -509,13 +536,13 @@ class TableauWindow(tk.Toplevel):
         pad_x = max(10.0, cell_w * 0.06)
         pad_y = max(10.0, cell_h * 0.08)
 
-        for index, name in enumerate(names):
+        for index, entry in enumerate(entries):
             row, col = divmod(index, cols)
             x1 = col * cell_w + pad_x
             y1 = row * cell_h + pad_y
             x2 = (col + 1) * cell_w - pad_x
             y2 = (row + 1) * cell_h - pad_y
-            status = self._statuses.get(name)
+            status = self._statuses.get(entry["unit"])
             color = self._tile_color(status)
             radius = min(28.0, (x2 - x1) * 0.12, (y2 - y1) * 0.12)
             rounded_rect(
@@ -528,6 +555,9 @@ class TableauWindow(tk.Toplevel):
                 fill=color,
                 outline="",
             )
+            if status_should_hatch(status):
+                self._draw_hatch(x1, y1, x2, y2, radius)
+            label = entry["label"]
             font_size = max(14, min(36, int(min(x2 - x1, y2 - y1) * 0.14)))
             font = ("DejaVu Sans", font_size, "bold")
             cx = (x1 + x2) / 2
@@ -537,7 +567,7 @@ class TableauWindow(tk.Toplevel):
                 self.canvas.create_text(
                     cx + dx,
                     cy + dy,
-                    text=name,
+                    text=label,
                     fill="#000000",
                     font=font,
                     width=text_width,
@@ -546,12 +576,36 @@ class TableauWindow(tk.Toplevel):
             self.canvas.create_text(
                 cx,
                 cy,
-                text=name,
+                text=label,
                 fill="#ffffff",
                 font=font,
                 width=text_width,
                 justify="center",
             )
+
+    def _draw_hatch(
+        self, x1: float, y1: float, x2: float, y2: float, radius: float
+    ) -> None:
+        inset = max(4.0, radius * 0.25)
+        left, top, right, bottom = x1 + inset, y1 + inset, x2 - inset, y2 - inset
+        spacing = max(12.0, min(right - left, bottom - top) * 0.12)
+        line_w = max(3, int(spacing * 0.28))
+        k = left + top
+        k_max = right + bottom
+        while k <= k_max:
+            xa = max(left, k - bottom)
+            xb = min(right, k - top)
+            if xa < xb:
+                self.canvas.create_line(
+                    xa,
+                    k - xa,
+                    xb,
+                    k - xb,
+                    fill=STATUS_HATCH,
+                    width=line_w,
+                    capstyle=tk.ROUND,
+                )
+            k += spacing
 
 
 class App(tk.Tk):
@@ -568,8 +622,10 @@ class App(tk.Tk):
         self.print_count = 0
         self.last_poll: Optional[float] = None
         self.busy = False
-        self.responsible_units: List[str] = list(config["responsible_units"])
-        self.responsible_set = set(self.responsible_units)
+        self.responsible_units: List[Dict[str, str]] = list(
+            config["responsible_units"]
+        )
+        self.responsible_set = {u["unit"] for u in self.responsible_units}
         self.print_filter = config["print_filter"]
         self.tableau: Optional[TableauWindow] = None
         self._units_poll_job: Optional[str] = None
