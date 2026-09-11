@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import ttk
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urljoin
 
 import requests
@@ -32,6 +33,21 @@ APP_NAME = "2426_HADP"
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT_API = 30
 READ_TIMEOUT_PDF = 60
+PRINT_FILTERS = ("none", "all", "only_responsible")
+
+# Same palette as f1937 dash (web/utility.js)
+UNIT_STATUS_COLORS: Dict[Union[int, str], str] = {
+    0: "#E24B4A",
+    1: "#4ee2a7",
+    2: "#4ee2a7",
+    3: "#4aace2",
+    4: "#e8a000",
+    5: "#E24B4A",
+    6: "#888888",
+    "A": "#e8a000",
+}
+FLASH_STATUSES = {0, 5, "A"}
+UNKNOWN_STATUS_COLOR = "#444444"
 
 
 def load_config() -> Dict[str, Any]:
@@ -55,12 +71,23 @@ def load_config() -> Dict[str, Any]:
     theme = str(data.get("theme") or "forest-dark")
     if theme not in ("forest-dark", "forest-light"):
         theme = "forest-dark"
+    raw_units = data.get("responsible_units") or []
+    if not isinstance(raw_units, list):
+        raise ValueError("config.yml: responsible_units muss eine Liste sein")
+    responsible = [str(u).strip() for u in raw_units if str(u).strip()]
+    print_filter = str(data.get("print_filter") or "all").strip().lower()
+    if print_filter not in PRINT_FILTERS:
+        raise ValueError(
+            "config.yml: print_filter muss none, all oder only_responsible sein"
+        )
     return {
         "host_url": host,
         "bearer_token": token,
         "poll_interval_seconds": interval,
         "printer": str(data.get("printer") or "").strip(),
         "theme": theme,
+        "responsible_units": responsible,
+        "print_filter": print_filter,
     }
 
 
@@ -88,6 +115,93 @@ def depesche_id(item: Dict[str, Any]) -> str:
     unit = str(item.get("unit") or "")
     ts = item.get("timestamp", "")
     return f"{ts}|{unit}|{link}"
+
+
+def normalize_unit_status(raw: Any) -> Union[int, str, None]:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if stripped.upper() == "A":
+            return "A"
+        if stripped.isdigit() or (stripped.startswith("-") and stripped[1:].isdigit()):
+            return int(stripped)
+        return stripped
+    if isinstance(raw, bool):
+        return int(raw)
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float) and raw.is_integer():
+        return int(raw)
+    return raw
+
+
+def unit_status_color(status: Any) -> str:
+    normalized = normalize_unit_status(status)
+    if normalized is None:
+        return UNKNOWN_STATUS_COLOR
+    return UNIT_STATUS_COLORS.get(normalized, "#E24B4A")
+
+
+def status_should_flash(status: Any) -> bool:
+    return normalize_unit_status(status) in FLASH_STATUSES
+
+
+def mix_hex(hex_color: str, other: str, amount: float) -> str:
+    """Blend hex_color toward other by amount (0..1)."""
+    amount = max(0.0, min(1.0, amount))
+
+    def parts(value: str) -> tuple[int, int, int]:
+        raw = value.lstrip("#")
+        if len(raw) != 6:
+            return (0, 0, 0)
+        return int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16)
+
+    r1, g1, b1 = parts(hex_color)
+    r2, g2, b2 = parts(other)
+    r = int(r1 + (r2 - r1) * amount)
+    g = int(g1 + (g2 - g1) * amount)
+    b = int(b1 + (b2 - b1) * amount)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def rounded_rect(
+    canvas: tk.Canvas,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    radius: float,
+    **kwargs: Any,
+) -> int:
+    radius = max(0.0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+    points = [
+        x1 + radius,
+        y1,
+        x2 - radius,
+        y1,
+        x2,
+        y1,
+        x2,
+        y1 + radius,
+        x2,
+        y2 - radius,
+        x2,
+        y2,
+        x2 - radius,
+        y2,
+        x1 + radius,
+        y2,
+        x1,
+        y2,
+        x1,
+        y2 - radius,
+        x1,
+        y1 + radius,
+        x1,
+        y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, splinesteps=36, **kwargs)
 
 
 def format_network_error(exc: BaseException) -> str:
@@ -168,27 +282,37 @@ class ApiClient:
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
         self.session.headers["Accept"] = "application/json"
-        # Keine endlosen Hänger bei defekten Verbindungen
         adapter = requests.adapters.HTTPAdapter(max_retries=0)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
-    def fetch_depeschen(self, since: int) -> List[Dict[str, Any]]:
-        url = f"{self.host_url}/api/depeschen"
+    def _get_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
         try:
             with self._lock:
                 response = self.session.get(
                     url,
-                    params={"since": since},
+                    params=params,
                     timeout=(CONNECT_TIMEOUT, READ_TIMEOUT_API),
                 )
             response.raise_for_status()
         except req_exc.RequestException as exc:
             raise RuntimeError(format_network_error(exc)) from exc
         try:
-            payload = response.json()
+            return response.json()
         except (ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError("Ungültige JSON-Antwort vom Server") from exc
+
+    def fetch_depeschen(self, since: int) -> List[Dict[str, Any]]:
+        payload = self._get_json(
+            f"{self.host_url}/api/depeschen",
+            params={"since": since},
+        )
+        if not isinstance(payload, list):
+            raise ValueError("API hat keine JSON-Liste zurückgegeben")
+        return payload
+
+    def fetch_units(self) -> List[Dict[str, Any]]:
+        payload = self._get_json(f"{self.host_url}/api/units")
         if not isinstance(payload, list):
             raise ValueError("API hat keine JSON-Liste zurückgegeben")
         return payload
@@ -240,10 +364,194 @@ class Poller(threading.Thread):
                 items = self.client.fetch_depeschen(self.since)
                 self.events.put(("poll_ok", items))
             except Exception as exc:
-                # Jeder Fehler (Netzwerk, Timeout, …) — Poller läuft weiter
                 self.events.put(("poll_error", format_network_error(exc)))
             if self.stop_event.wait(self.interval):
                 break
+
+
+class TableauWindow(tk.Toplevel):
+    """Large status board for responsible units, ordered as in config."""
+
+    def __init__(
+        self,
+        master: tk.Tk,
+        unit_names: List[str],
+        dark: bool,
+        on_close,
+    ) -> None:
+        super().__init__(master)
+        self.title(f"{APP_NAME} — Tableau")
+        self.unit_names = list(unit_names)
+        self._on_close = on_close
+        self.protocol("WM_DELETE_WINDOW", self._handle_close)
+        self.minsize(720, 320)
+
+        bg = "#1e1e1e" if dark else "#f5f5f0"
+        muted = "#9a9a9a" if dark else "#666666"
+        self.configure(background=bg)
+        self._bg = bg
+        self._muted = muted
+        self._flash_phase = 0.0
+        self._flash_job: Optional[str] = None
+        self._flash_period_ms = 700
+        self._flash_tick_ms = 40
+        # Share of the cycle spent fading up (short) vs down (longer)
+        self._flash_rise_share = 0.32
+
+        header = ttk.Frame(self, padding=(24, 16))
+        header.pack(fill="x")
+        ttk.Label(header, text="Tableau", style="Title.TLabel").pack(side="left")
+
+        header_right = ttk.Frame(header)
+        header_right.pack(side="right")
+        self.status_dot = ttk.Label(
+            header_right, text="●  Verbinden…", style="StatusConnecting.TLabel"
+        )
+        self.status_dot.pack(anchor="e")
+        self.var_detail = tk.StringVar(value="Warte auf Status…")
+        ttk.Label(
+            header_right, textvariable=self.var_detail, style="Muted.TLabel"
+        ).pack(anchor="e", pady=(4, 0))
+
+        self.canvas = tk.Canvas(self, background=bg, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self.canvas.bind("<Configure>", lambda _e: self._redraw())
+
+        self._statuses: Dict[str, Any] = {name: None for name in self.unit_names}
+        self._redraw()
+        self._tick_flash()
+
+    def _handle_close(self) -> None:
+        self.dispose()
+        self._on_close()
+
+    def dispose(self) -> None:
+        if self._flash_job is not None:
+            try:
+                self.after_cancel(self._flash_job)
+            except Exception:
+                pass
+            self._flash_job = None
+
+    def _set_status(self, kind: str, detail: str) -> None:
+        styles = {
+            "connecting": ("●  Verbinden…", "StatusConnecting.TLabel"),
+            "online": ("●  Online", "StatusOnline.TLabel"),
+            "offline": ("●  Offline", "StatusOffline.TLabel"),
+        }
+        text, style_name = styles.get(kind, ("●  Status", "Status.TLabel"))
+        self.status_dot.configure(text=text, style=style_name)
+        self.var_detail.set(detail)
+
+    def _tick_flash(self) -> None:
+        self._flash_phase = (
+            self._flash_phase + self._flash_tick_ms / self._flash_period_ms
+        ) % 1.0
+        if any(status_should_flash(self._statuses.get(name)) for name in self.unit_names):
+            self._redraw()
+        self._flash_job = self.after(self._flash_tick_ms, self._tick_flash)
+
+    def update_units(self, units: List[Dict[str, Any]], error: str = "") -> None:
+        by_name = {
+            str(u.get("name") or "").strip(): u
+            for u in units
+            if isinstance(u, dict) and str(u.get("name") or "").strip()
+        }
+        for name in self.unit_names:
+            unit = by_name.get(name)
+            self._statuses[name] = None if unit is None else unit.get("status")
+        if error:
+            self._set_status("offline", f"Abruf fehlgeschlagen: {error}")
+        else:
+            self._set_status("online", f"Aktualisiert {format_ts(time.time())}")
+        self._redraw()
+
+    def _flash_brightness(self) -> float:
+        """Incandescent-style pulse: short fade-on, longer fade-off."""
+        rise = self._flash_rise_share
+        if self._flash_phase < rise:
+            t = self._flash_phase / rise
+            # Ease into full brightness quickly
+            wave = t * t * (3.0 - 2.0 * t)
+        else:
+            t = (self._flash_phase - rise) / (1.0 - rise)
+            # Softer, longer decay
+            wave = (1.0 - t) ** 1.7
+        return 0.16 + 0.84 * wave
+
+    def _tile_color(self, status: Any) -> str:
+        color = unit_status_color(status)
+        if not status_should_flash(status):
+            return color
+        dim = 1.0 - self._flash_brightness()
+        return mix_hex(color, self._bg, 0.12 + 0.78 * dim)
+
+    def _redraw(self) -> None:
+        self.canvas.delete("all")
+        width = max(self.canvas.winfo_width(), 1)
+        height = max(self.canvas.winfo_height(), 1)
+        names = self.unit_names
+        if not names:
+            self.canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Keine zuständigen Einheiten in der Config",
+                fill=self._muted,
+                font=("DejaVu Sans", 18),
+            )
+            return
+
+        count = len(names)
+        cols = max(1, min(count, int(math.ceil(math.sqrt(count)))))
+        rows = int(math.ceil(count / cols))
+        cell_w = width / cols
+        cell_h = height / rows
+        pad_x = max(10.0, cell_w * 0.06)
+        pad_y = max(10.0, cell_h * 0.08)
+
+        for index, name in enumerate(names):
+            row, col = divmod(index, cols)
+            x1 = col * cell_w + pad_x
+            y1 = row * cell_h + pad_y
+            x2 = (col + 1) * cell_w - pad_x
+            y2 = (row + 1) * cell_h - pad_y
+            status = self._statuses.get(name)
+            color = self._tile_color(status)
+            radius = min(28.0, (x2 - x1) * 0.12, (y2 - y1) * 0.12)
+            rounded_rect(
+                self.canvas,
+                x1,
+                y1,
+                x2,
+                y2,
+                radius,
+                fill=color,
+                outline="",
+            )
+            font_size = max(14, min(36, int(min(x2 - x1, y2 - y1) * 0.14)))
+            font = ("DejaVu Sans", font_size, "bold")
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            text_width = max(40, int(x2 - x1 - 24))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (1, 1), (-1, 1)):
+                self.canvas.create_text(
+                    cx + dx,
+                    cy + dy,
+                    text=name,
+                    fill="#000000",
+                    font=font,
+                    width=text_width,
+                    justify="center",
+                )
+            self.canvas.create_text(
+                cx,
+                cy,
+                text=name,
+                fill="#ffffff",
+                font=font,
+                width=text_width,
+                justify="center",
+            )
 
 
 class App(tk.Tk):
@@ -260,6 +568,12 @@ class App(tk.Tk):
         self.print_count = 0
         self.last_poll: Optional[float] = None
         self.busy = False
+        self.responsible_units: List[str] = list(config["responsible_units"])
+        self.responsible_set = set(self.responsible_units)
+        self.print_filter = config["print_filter"]
+        self.tableau: Optional[TableauWindow] = None
+        self._units_poll_job: Optional[str] = None
+        self._units_fetching = False
 
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -280,7 +594,14 @@ class App(tk.Tk):
         )
         self.poller.start()
         self.after(150, self._drain_events)
-        self._set_status("waiting", "Warte auf ersten Abruf…")
+        self._set_status("connecting", "Warte auf ersten Abruf…")
+
+    def should_auto_print(self, unit: str) -> bool:
+        if self.print_filter == "none":
+            return False
+        if self.print_filter == "all":
+            return True
+        return unit in self.responsible_set
 
     def _apply_forest_theme(self, theme: str) -> None:
         tcl = THEME_DIR / f"{theme}.tcl"
@@ -291,8 +612,16 @@ class App(tk.Tk):
         style.theme_use(theme)
         self.configure(background=style.lookup(".", "background") or "#313131")
         style.configure("Status.TLabel", font=("DejaVu Sans", 11, "bold"))
+        style.configure("StatusOnline.TLabel", font=("DejaVu Sans", 11, "bold"), foreground="#4ee2a7")
+        style.configure("StatusOffline.TLabel", font=("DejaVu Sans", 11, "bold"), foreground="#E24B4A")
+        style.configure("StatusConnecting.TLabel", font=("DejaVu Sans", 11, "bold"), foreground="#e8a000")
         style.configure("Muted.TLabel", foreground="#b0b0b0")
         style.configure("Title.TLabel", font=("DejaVu Sans", 16, "bold"))
+        style.configure("Switch", foreground="#b0b0b0")
+        style.map(
+            "Switch",
+            foreground=[("selected", "#4ee2a7"), ("!selected", "#b0b0b0")],
+        )
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=20)
@@ -303,8 +632,21 @@ class App(tk.Tk):
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 16))
         ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left")
-        self.status_dot = ttk.Label(header, text="●  startet", style="Status.TLabel")
-        self.status_dot.pack(side="right")
+        header_right = ttk.Frame(header)
+        header_right.pack(side="right")
+        self.status_dot = ttk.Label(
+            header_right, text="●  Verbinden…", style="StatusConnecting.TLabel"
+        )
+        self.status_dot.pack(anchor="e")
+        self.var_tableau = tk.BooleanVar(value=False)
+        self.tableau_switch = ttk.Checkbutton(
+            header_right,
+            text="Tableau",
+            style="Switch",
+            variable=self.var_tableau,
+            command=self._on_tableau_toggled,
+        )
+        self.tableau_switch.pack(anchor="e", pady=(6, 0))
 
         status_card = ttk.LabelFrame(outer, text="Status", padding=(16, 12))
         status_card.grid(row=1, column=0, sticky="ew", pady=(0, 16))
@@ -321,6 +663,12 @@ class App(tk.Tk):
         self.var_polls = tk.StringVar(value="0")
         self.var_detail = tk.StringVar(value="")
         self.var_printer = tk.StringVar(value="")
+        filter_label = {
+            "none": "kein Auto-Druck",
+            "all": "alle",
+            "only_responsible": "nur zuständige",
+        }.get(self.print_filter, self.print_filter)
+        self.var_filter = tk.StringVar(value=filter_label)
 
         self._status_cell(status_card, 0, 0, "Host", self.var_host)
         self._status_cell(status_card, 0, 1, "Abrufintervall", self.var_interval)
@@ -328,15 +676,16 @@ class App(tk.Tk):
         self._status_cell(status_card, 0, 3, "Letzter Abruf", self.var_last_poll)
         self._status_cell(status_card, 1, 0, "Abrufe", self.var_polls)
         self._status_cell(status_card, 1, 1, "Gedruckt (Sitzung)", self.var_printed)
+        self._status_cell(status_card, 1, 2, "Druckfilter", self.var_filter)
 
         printer_box = ttk.Frame(status_card)
-        printer_box.grid(row=1, column=2, columnspan=2, sticky="ew", padx=8, pady=8)
+        printer_box.grid(row=1, column=3, sticky="ew", padx=8, pady=8)
         ttk.Label(printer_box, text="Drucker", style="Muted.TLabel").pack(anchor="w")
         self.printer_combo = ttk.Combobox(
             printer_box,
             textvariable=self.var_printer,
             state="readonly",
-            width=48,
+            width=36,
         )
         self.printer_combo.pack(fill="x", pady=(4, 0))
         self.printer_combo.bind("<<ComboboxSelected>>", self._on_printer_changed)
@@ -346,7 +695,7 @@ class App(tk.Tk):
         )
 
         list_card = ttk.LabelFrame(
-            outer, text="Zuletzt gedruckte Depeschen", padding=(12, 10)
+            outer, text="Zuletzt empfangene Depeschen", padding=(12, 10)
         )
         list_card.grid(row=2, column=0, sticky="nsew")
         list_card.columnconfigure(0, weight=1)
@@ -376,7 +725,8 @@ class App(tk.Tk):
         self.tree.column("time", width=170, anchor="w")
         self.tree.column("unit", width=160, anchor="w")
         self.tree.column("file", width=280, anchor="w")
-        self.tree.column("result", width=140, anchor="w")
+        self.tree.column("result", width=160, anchor="w")
+        self.tree.tag_configure("skipped", foreground="#7a7a7a")
         self.tree.bind("<Double-1>", lambda _e: self.open_selected())
 
         actions = ttk.Frame(list_card)
@@ -389,7 +739,7 @@ class App(tk.Tk):
         self.reset_btn.pack(side="left")
         self.reprint_btn = ttk.Button(
             actions,
-            text="Auswahl erneut drucken",
+            text="Auswahl drucken",
             style="Accent.TButton",
             command=self.reprint_selected,
         )
@@ -431,14 +781,100 @@ class App(tk.Tk):
             save_state({**load_state(), "printer": printer})
             self.var_detail.set(f"Drucker gesetzt auf {printer}")
 
+    def _on_tableau_toggled(self) -> None:
+        if self.var_tableau.get():
+            self._open_tableau()
+        else:
+            self._close_tableau()
+
+    def _open_tableau(self) -> None:
+        if self.tableau is not None and self.tableau.winfo_exists():
+            self.tableau.lift()
+            return
+        dark = self.config_data["theme"] == "forest-dark"
+        self.tableau = TableauWindow(
+            self,
+            self.responsible_units,
+            dark=dark,
+            on_close=self._close_tableau,
+        )
+        self.var_tableau.set(True)
+        self._schedule_units_poll(immediate=True)
+
+    def _close_tableau(self) -> None:
+        if self._units_poll_job is not None:
+            try:
+                self.after_cancel(self._units_poll_job)
+            except Exception:
+                pass
+            self._units_poll_job = None
+        if self.tableau is not None:
+            try:
+                self.tableau.dispose()
+                if self.tableau.winfo_exists():
+                    self.tableau.destroy()
+            except tk.TclError:
+                pass
+            self.tableau = None
+        self.var_tableau.set(False)
+
+    def _schedule_units_poll(self, immediate: bool = False) -> None:
+        if self._units_poll_job is not None:
+            try:
+                self.after_cancel(self._units_poll_job)
+            except Exception:
+                pass
+            self._units_poll_job = None
+        delay = 0 if immediate else self.config_data["poll_interval_seconds"] * 1000
+        self._units_poll_job = self.after(delay, self._units_poll_tick)
+
+    def _units_poll_tick(self) -> None:
+        self._units_poll_job = None
+        if self.tableau is None or not self.tableau.winfo_exists():
+            return
+        if not self._units_fetching:
+            self._units_fetching = True
+            threading.Thread(
+                target=self._fetch_units_worker,
+                daemon=True,
+                name="units-poll",
+            ).start()
+        self._schedule_units_poll(immediate=False)
+
+    def _fetch_units_worker(self) -> None:
+        try:
+            units = self.client.fetch_units()
+            self.after(0, self._on_units_ok, units)
+        except Exception as exc:
+            message = format_network_error(exc)
+            self.after(0, self._on_units_error, message)
+        finally:
+            self._units_fetching = False
+
+    def _on_units_ok(self, units: List[Dict[str, Any]]) -> None:
+        if self.tableau is not None and self.tableau.winfo_exists():
+            self.tableau.update_units(units)
+
+    def _on_units_error(self, message: str) -> None:
+        if self.tableau is not None and self.tableau.winfo_exists():
+            self.tableau.update_units([], error=message)
+
     def _set_status(self, kind: str, detail: str) -> None:
-        labels = {
-            "ok": "●  online",
-            "error": "●  Fehler",
-            "waiting": "●  wartend",
-            "printing": "●  druckt",
+        """Update connection indicator and optional detail line.
+
+        kind is only the link state: connecting | online | offline.
+        Activity (printing, reset, …) belongs in detail, not the indicator.
+        """
+        styles = {
+            "connecting": ("●  Verbinden…", "StatusConnecting.TLabel"),
+            "online": ("●  Online", "StatusOnline.TLabel"),
+            "offline": ("●  Offline", "StatusOffline.TLabel"),
         }
-        self.status_dot.configure(text=labels.get(kind, "●  Status"))
+        text, style_name = styles.get(kind, ("●  Status", "Status.TLabel"))
+        self.status_dot.configure(text=text, style=style_name)
+        self.var_detail.set(detail)
+
+    def _set_detail(self, detail: str) -> None:
         self.var_detail.set(detail)
 
     def _drain_events(self) -> None:
@@ -452,7 +888,7 @@ class App(tk.Tk):
                     self.var_polls.set(str(self.poll_count))
                     self.last_poll = time.time()
                     self.var_last_poll.set(format_ts(self.last_poll))
-                    self._set_status("error", f"Abruf fehlgeschlagen: {payload}")
+                    self._set_status("offline", f"Abruf fehlgeschlagen: {payload}")
         except queue.Empty:
             pass
         if not self.stop_event.is_set():
@@ -474,12 +910,19 @@ class App(tk.Tk):
             new_items.append(item)
         if not new_items:
             self._set_status(
-                "ok", f"Abruf ok — {len(items)} bekannt, nichts Neues"
+                "online", f"Abruf ok — {len(items)} bekannt, nichts Neues"
             )
             return
         printer = self.var_printer.get().strip()
+        to_print = sum(
+            1
+            for item in new_items
+            if self.should_auto_print(str(item.get("unit") or ""))
+        )
         self._set_status(
-            "printing", f"Drucke {len(new_items)} neue Depesche(n)…"
+            "online",
+            f"Verarbeite {len(new_items)} neue Depesche(n)"
+            f" ({to_print} Druck)…",
         )
         threading.Thread(
             target=self._print_batch,
@@ -495,7 +938,7 @@ class App(tk.Tk):
         self.after(
             0,
             lambda: self._set_status(
-                "ok",
+                "online",
                 f"Stapel fertig ({len(items)}). Letzter Abruf {format_ts(self.last_poll)}",
             ),
         )
@@ -507,14 +950,20 @@ class App(tk.Tk):
         filename = Path(pdf_link).name or "depesche.pdf"
         dest = CACHE_DIR / filename
         iid = depesche_id(item)
+        auto_print = self.should_auto_print(unit)
         result = "gedruckt"
         error = ""
+        skipped = False
         try:
-            if not printer:
-                raise RuntimeError("Bitte zuerst einen Drucker wählen")
             if not dest.is_file():
                 self.client.download_pdf(pdf_link, dest)
-            printing.print_pdf(str(dest), printer)
+            if not auto_print:
+                result = "nicht gedruckt"
+                skipped = True
+            else:
+                if not printer:
+                    raise RuntimeError("Bitte zuerst einen Drucker wählen")
+                printing.print_pdf(str(dest), printer)
         except Exception as exc:
             result = "fehlgeschlagen"
             error = format_network_error(exc)
@@ -527,6 +976,7 @@ class App(tk.Tk):
             "path": str(dest),
             "result": result,
             "error": error,
+            "skipped": skipped,
             "printed_at": time.time(),
         }
 
@@ -540,6 +990,7 @@ class App(tk.Tk):
             result = f"fehlgeschlagen: {row['error']}"
         if self.tree.exists(row["id"]):
             self.tree.delete(row["id"])
+        tags = ("skipped",) if row.get("skipped") else ()
         self.tree.insert(
             "",
             0,
@@ -550,6 +1001,7 @@ class App(tk.Tk):
                 row["filename"],
                 result,
             ),
+            tags=tags,
         )
         children = self.tree.get_children()
         if len(children) > RECENT_LIMIT:
@@ -567,9 +1019,9 @@ class App(tk.Tk):
             return
         try:
             open_with_default_app(Path(row["path"]))
-            self.var_detail.set(f"Geöffnet: {row['filename']}")
+            self._set_detail(f"Geöffnet: {row['filename']}")
         except Exception as exc:
-            self._set_status("error", f"Öffnen fehlgeschlagen: {exc}")
+            self._set_detail(f"Öffnen fehlgeschlagen: {exc}")
 
     def reset_session(self) -> None:
         now = int(time.time())
@@ -583,15 +1035,14 @@ class App(tk.Tk):
         self.print_count = 0
         self.var_printed.set("0")
         self.var_since.set(format_ts(now))
-        self._set_status(
-            "waiting",
-            f"Reset — seit {format_ts(now)}, Cache geleert ({removed} Datei(en))",
+        self._set_detail(
+            f"Reset — seit {format_ts(now)}, Cache geleert ({removed} Datei(en))"
         )
 
     def reprint_selected(self) -> None:
         selected = self.tree.selection()
         if not selected:
-            self.var_detail.set("Depesche zum erneuten Drucken auswählen")
+            self.var_detail.set("Depesche zum Drucken auswählen")
             return
         iid = selected[0]
         row = self.rows.get(iid)
@@ -617,7 +1068,7 @@ class App(tk.Tk):
             printing.print_pdf(str(dest), printer)
             self.after(
                 0,
-                lambda: self._finish_reprint(row["id"], "erneut gedruckt", ""),
+                lambda: self._finish_reprint(row["id"], "gedruckt", ""),
             )
         except Exception as exc:
             message = format_network_error(exc)
@@ -629,20 +1080,26 @@ class App(tk.Tk):
     def _finish_reprint(self, iid: str, result: str, error: str) -> None:
         self.reprint_btn.state(["!disabled"])
         display = result if not error else f"fehlgeschlagen: {error}"
+        row = self.rows.get(iid)
+        if row is not None:
+            row["result"] = result
+            row["error"] = error
+            row["skipped"] = False
         if self.tree.exists(iid):
             values = list(self.tree.item(iid, "values"))
             if len(values) >= 4:
                 values[3] = display
-                self.tree.item(iid, values=values)
+                self.tree.item(iid, values=values, tags=())
         if error:
-            self._set_status("error", f"Erneuter Druck fehlgeschlagen: {error}")
+            self._set_detail(f"Druck fehlgeschlagen: {error}")
         else:
-            self._set_status("ok", "Erneut gedruckt")
+            self._set_detail("Gedruckt")
             self.print_count += 1
             self.var_printed.set(str(self.print_count))
 
     def on_close(self) -> None:
         self.stop_event.set()
+        self._close_tableau()
         self.destroy()
 
 

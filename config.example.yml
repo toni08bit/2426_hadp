@@ -8,5 +8,18 @@ bearer_token: "replace-with-your-token"
 # Optionaler Standarddrucker (CUPS-Druckername). Kann auch in der UI gewählt werden.
 printer: ""
 
+# Einheiten, für die dieses Deployment zuständig ist (Namen wie in /api/units).
+# Reihenfolge = Reihenfolge der Lichter im Tableau.
+responsible_units:
+  - EIMSB-HLF-1
+  - EIMSB-LF-2
+
+# Automatischer Druckfilter:
+#   none              — nie automatisch drucken
+#   all               — alle Depeschen drucken
+#   only_responsible  — nur zuständige Einheiten drucken
+# Alle Depeschen erscheinen weiterhin in der Liste; gefilterte Einträge sind blasser.
+print_filter: only_responsible
+
 # forest-dark oder forest-light
 theme: forest-dark

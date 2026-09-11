@@ -311,15 +311,15 @@ namespace eval ttk::theme::forest-dark {
                 active $I(check-unsel-hover) \
             ] -width 26 -sticky w
 
-        # Switch
+        # Switch — gray when off, accent green when on
         ttk::style element create Switch.indicator image \
-            [list $I(off-accent) \
+            [list $I(off-basic) \
                 {selected disabled} $I(on-basic) \
                 disabled $I(off-basic) \
                 {pressed selected} $I(on-accent) \
                 {active selected} $I(on-hover) \
                 selected $I(on-accent) \
-                {pressed !selected} $I(off-accent) \
+                {pressed !selected} $I(off-basic) \
                 active $I(off-hover) \
             ] -width 46 -sticky w
 
