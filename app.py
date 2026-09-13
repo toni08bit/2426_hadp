@@ -23,6 +23,7 @@ import yaml
 from requests import exceptions as req_exc
 
 import printing
+from relay_multicast import RelayMulticastSender
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.yml"
@@ -493,6 +494,12 @@ class TableauWindow(tk.Toplevel):
             self._set_status("online", f"Aktualisiert {format_ts(time.time())}")
         self._redraw()
 
+    def statuses_by_label(self) -> Dict[str, Any]:
+        """Map tableau display labels to current unit statuses."""
+        return {
+            entry["label"]: self._statuses.get(entry["unit"]) for entry in self.units
+        }
+
     def _flash_brightness(self) -> float:
         """Incandescent-style pulse: short fade-on, longer fade-off."""
         rise = self._flash_rise_share
@@ -628,6 +635,7 @@ class App(tk.Tk):
         self.responsible_set = {u["unit"] for u in self.responsible_units}
         self.print_filter = config["print_filter"]
         self.tableau: Optional[TableauWindow] = None
+        self.relay_sender: Optional[RelayMulticastSender] = None
         self._units_poll_job: Optional[str] = None
         self._units_fetching = False
 
@@ -865,6 +873,10 @@ class App(tk.Tk):
             on_close=self._close_tableau,
         )
         self.var_tableau.set(True)
+        labels = [u["label"] for u in self.responsible_units]
+        self.relay_sender = RelayMulticastSender(labels)
+        self.relay_sender.start()
+        self._sync_relay_statuses()
         self._schedule_units_poll(immediate=True)
 
     def _close_tableau(self) -> None:
@@ -874,6 +886,9 @@ class App(tk.Tk):
             except Exception:
                 pass
             self._units_poll_job = None
+        if self.relay_sender is not None:
+            self.relay_sender.stop()
+            self.relay_sender = None
         if self.tableau is not None:
             try:
                 self.tableau.dispose()
@@ -883,6 +898,13 @@ class App(tk.Tk):
                 pass
             self.tableau = None
         self.var_tableau.set(False)
+
+    def _sync_relay_statuses(self) -> None:
+        if self.relay_sender is None or self.tableau is None:
+            return
+        if not self.tableau.winfo_exists():
+            return
+        self.relay_sender.set_statuses(self.tableau.statuses_by_label())
 
     def _schedule_units_poll(self, immediate: bool = False) -> None:
         if self._units_poll_job is not None:
@@ -920,10 +942,12 @@ class App(tk.Tk):
     def _on_units_ok(self, units: List[Dict[str, Any]]) -> None:
         if self.tableau is not None and self.tableau.winfo_exists():
             self.tableau.update_units(units)
+            self._sync_relay_statuses()
 
     def _on_units_error(self, message: str) -> None:
         if self.tableau is not None and self.tableau.winfo_exists():
             self.tableau.update_units([], error=message)
+            self._sync_relay_statuses()
 
     def _set_status(self, kind: str, detail: str) -> None:
         """Update connection indicator and optional detail line.
